@@ -494,8 +494,10 @@ impl MonitoredItem {
                     .source_timestamp
                     .is_some_and(|v| value.source_timestamp.is_none_or(|v2| v2 >= v))
             {
-                // The pending value is due, but still has to pass the data-change filter.
-                extra_enqueued = self.notify_data_value(skipped.value, now, true);
+                // A due non-zero sample can bypass the interval check, but subscription
+                // sampling must still wait for an actual subscription tick.
+                let sample_is_due = matches!(self.sampling_interval, SamplingInterval::NonZero(_));
+                extra_enqueued = self.notify_data_value(skipped.value, now, sample_is_due);
                 if extra_enqueued {
                     self.last_sampled_at = Some(skipped.due_at);
                 }
@@ -1217,5 +1219,46 @@ pub(super) mod tests {
             skipped.due_at,
             (start + TimeDelta::milliseconds(200)).into()
         );
+    }
+
+    #[test]
+    fn subscription_sampling_keeps_only_the_latest_value_until_tick() {
+        let start = Utc::now();
+        let mut item = new_monitored_item(
+            1,
+            ReadValueId {
+                node_id: NodeId::null(),
+                attribute_id: AttributeId::Value as u32,
+                ..Default::default()
+            },
+            MonitoringMode::Reporting,
+            FilterType::None,
+            SamplingInterval::Subscription,
+            true,
+            Some(DataValue::new_at(0, start.into())),
+        );
+
+        let first = start + TimeDelta::milliseconds(10);
+        assert!(item.notify_data_value(DataValue::new_at(1, first.into()), &first.into(), false));
+        let second = start + TimeDelta::milliseconds(20);
+        assert!(item.notify_data_value(DataValue::new_at(2, second.into()), &second.into(), false));
+        assert_eq!(item.notification_queue.len(), 1);
+        assert_eq!(
+            item.sample_skipped_data_value
+                .as_ref()
+                .unwrap()
+                .value
+                .value,
+            Some(Variant::Int32(2))
+        );
+
+        let tick = start + TimeDelta::milliseconds(100);
+        assert!(item.maybe_enqueue_skipped_value(&tick.into()));
+        assert_eq!(item.notification_queue.len(), 2);
+        let Notification::MonitoredItemNotification(sampled) = &item.notification_queue[1] else {
+            panic!("expected sampled value");
+        };
+        assert_eq!(sampled.value.value, Some(Variant::Int32(2)));
+        assert_eq!(sampled.value.source_timestamp, Some(second.into()));
     }
 }
