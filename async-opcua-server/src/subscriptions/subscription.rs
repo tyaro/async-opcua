@@ -1120,7 +1120,7 @@ mod tests {
         assert_eq!(m.value.value, Some(Variant::Int32(2)));
         assert_eq!(
             m.value.source_timestamp,
-            Some(DateTime::from(offset(start_dt, start, 150).0))
+            Some(DateTime::from(start_dt - TimeDelta::days(1)))
         );
     }
 
