@@ -97,6 +97,15 @@ pub(crate) struct SessionStarter<T> {
     subscriptions: Arc<SubscriptionCache>,
 }
 
+/// Aborts the wrapped task when dropped. Aborting a task that already finished does nothing.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 impl<T: Connector> SessionStarter<T> {
     pub(crate) fn new(
         connector: T,
@@ -505,7 +514,10 @@ impl SessionController {
                     .message_handler
                     .handle_message(message, session_id, session, user_token, id)
                 {
-                    super::message_handler::HandleMessageResult::AsyncMessage(mut handle) => {
+                    super::message_handler::HandleMessageResult::AsyncMessage(handle) => {
+                        // Abort the service call if the connection closes before it finishes,
+                        // instead of letting it run detached once nobody can receive the response.
+                        let mut handle = AbortOnDrop(handle);
                         self.pending_messages
                             .push(Box::pin(async move {
                                 // Select biased because if for some reason there's a long time between polls,
@@ -513,7 +525,7 @@ impl SessionController {
                                 // if the call has not been finished yet.
                                 tokio::select! {
                                     biased;
-                                    r = &mut handle => {
+                                    r = &mut handle.0 => {
                                         match r {
                                             Ok(r) => {
                                                 debug!(
@@ -529,7 +541,7 @@ impl SessionController {
                                         }
                                     }
                                     _ = tokio::time::sleep_until(deadline.into()) => {
-                                        handle.abort();
+                                        handle.0.abort();
                                         Ok(Response { message: ServiceFault::new(request_handle, StatusCode::BadTimeout).into(), request_id: id })
                                     }
                                 }
