@@ -129,8 +129,14 @@ impl SubscriptionState {
     ///
     /// Most users should simply call [`crate::Session::create_subscription`]
     pub fn add_subscription(&mut self, subscription: Subscription) {
-        self.subscriptions
-            .insert(subscription.subscription_id(), subscription);
+        // A new subscription numbers its notification messages from the start, and a server may give it the id of
+        // one this client still remembers (deleting it failed, or the server restarted and the delete was refused
+        // with BadNoSubscription). Marks kept for that old subscription would make its messages look already
+        // delivered and drop them.
+        let subscription_id = subscription.subscription_id();
+        self.heard_sequence_numbers.remove(&subscription_id);
+        self.delivered_sequence_numbers.remove(&subscription_id);
+        self.subscriptions.insert(subscription_id, subscription);
         self.set_keep_alive_timeout();
         self.update_publish_limits();
     }
@@ -376,7 +382,9 @@ mod sequence_tests {
     };
 
     use super::SubscriptionState;
-    use crate::session::services::subscriptions::PublishLimits;
+    use crate::{
+        session::services::subscriptions::PublishLimits, DataChangeCallback, Subscription,
+    };
 
     const SUBSCRIPTION: u32 = 1;
 
@@ -473,5 +481,30 @@ mod sequence_tests {
         state.handle_notification(SUBSCRIPTION, data(2));
 
         assert_eq!(acknowledged(&mut state), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_new_subscription_with_a_remembered_id_starts_without_marks() {
+        let mut state = state();
+        state.missed_before(SUBSCRIPTION, &data(1), &[1]);
+        state.handle_notification(SUBSCRIPTION, data(1));
+        state.missed_before(SUBSCRIPTION, &data(2), &[2]);
+        state.handle_notification(SUBSCRIPTION, data(2));
+        acknowledged(&mut state);
+
+        state.add_subscription(Subscription::new(
+            SUBSCRIPTION,
+            Duration::from_millis(100),
+            30,
+            10,
+            0,
+            0,
+            true,
+            Box::new(DataChangeCallback::new(|_, _| {})),
+        ));
+
+        assert!(state.missed_before(SUBSCRIPTION, &data(1), &[1]).is_empty());
+        state.handle_notification(SUBSCRIPTION, data(1));
+        assert_eq!(acknowledged(&mut state), vec![1]);
     }
 }
