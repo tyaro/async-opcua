@@ -307,6 +307,9 @@ pub struct MonitoredItem {
     /// Value skipped due to sampling interval, we keep these
     /// so that we can generate a new notification later.
     sample_skipped_data_value: Option<SkippedValue>,
+    /// A value carrying SemanticsChanged was dropped before it reached the queue,
+    /// or was removed from it. Part 4, 7.38.1: the next notification carries the bit.
+    pending_semantics_changed: bool,
     any_new_notification: bool,
     eu_range: Option<(f64, f64)>,
 }
@@ -339,6 +342,7 @@ impl MonitoredItem {
             last_data_value: None,
             last_sampled_at: None,
             sample_skipped_data_value: None,
+            pending_semantics_changed: false,
             queue_size: request.queue_size,
             notification_queue: VecDeque::new(),
             queue_overflow: false,
@@ -392,21 +396,28 @@ impl MonitoredItem {
         self.client_handle = request.requested_parameters.client_handle;
         self.discard_oldest = request.requested_parameters.discard_oldest;
 
-        // Shrink / grow the notification queue to the new threshold
+        self.shrink_queue_to_size();
+        (filter_res, StatusCode::Good)
+    }
+
+    /// Shrink the notification queue to the new threshold.
+    fn shrink_queue_to_size(&mut self) {
         if self.notification_queue.len() > self.queue_size {
             // Discard old notifications
             let discard = self.notification_queue.len() - self.queue_size;
             for _ in 0..discard {
-                if self.discard_oldest {
-                    let _ = self.notification_queue.pop_back();
+                let discarded = if self.discard_oldest {
+                    self.notification_queue.pop_back()
                 } else {
-                    let _ = self.notification_queue.pop_front();
+                    self.notification_queue.pop_front()
+                };
+                if carries_semantics_changed(discarded.as_ref()) {
+                    self.pending_semantics_changed = true;
                 }
             }
             // Shrink the queue
             self.notification_queue.shrink_to_fit();
         }
-        (filter_res, StatusCode::Good)
     }
 
     fn filter_by_sampling_interval(&self, new: &DataValue, from_subscription_tick: bool) -> bool {
@@ -487,6 +498,7 @@ impl MonitoredItem {
 
         let mut extra_enqueued = false;
         if let Some(skipped) = self.sample_skipped_data_value.take() {
+            let skipped_semantics_changed = skipped.value.status().semantics_changed();
             // We may use the skipped value if it is in the past,
             // and if it is earlier than the value we are currently reporting.
             if skipped.due_at <= *now
@@ -502,6 +514,9 @@ impl MonitoredItem {
                 if extra_enqueued {
                     self.last_sampled_at = Some(skipped.due_at);
                 }
+            } else if skipped_semantics_changed {
+                // The newer value replaces the skipped one; keep its SemanticsChanged.
+                self.pending_semantics_changed = true;
             }
         }
 
@@ -609,6 +624,13 @@ impl MonitoredItem {
 
     fn enqueue_notification(&mut self, notification: impl Into<Notification>) {
         self.any_new_notification = true;
+        let mut notification = notification.into();
+        if self.pending_semantics_changed {
+            if let Notification::MonitoredItemNotification(n) = &mut notification {
+                n.value.status = Some(n.value.status().set_semantics_changed(true));
+                self.pending_semantics_changed = false;
+            }
+        }
         let full = self.notification_queue.len() == self.queue_size;
         let mut semantics_changed_lost = false;
         if full {
@@ -617,13 +639,10 @@ impl MonitoredItem {
             } else {
                 self.notification_queue.pop_back()
             };
-            semantics_changed_lost = matches!(
-                discarded,
-                Some(Notification::MonitoredItemNotification(n)) if n.value.status().semantics_changed()
-            );
+            semantics_changed_lost = carries_semantics_changed(discarded.as_ref());
             self.queue_overflow = true;
         }
-        self.notification_queue.push_back(notification.into());
+        self.notification_queue.push_back(notification);
 
         // Part 4, 7.38.1: a SemanticsChanged bit must not be lost with a discarded
         // value. Carry it to the value that follows the gap in delivery order,
@@ -804,6 +823,13 @@ impl MonitoredItem {
     }
 }
 
+fn carries_semantics_changed(notification: Option<&Notification>) -> bool {
+    matches!(
+        notification,
+        Some(Notification::MonitoredItemNotification(n)) if n.value.status().semantics_changed()
+    )
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use chrono::{Duration, TimeDelta, Utc};
@@ -845,6 +871,7 @@ pub(super) mod tests {
             last_data_value: None,
             last_sampled_at: None,
             sample_skipped_data_value: None,
+            pending_semantics_changed: false,
             any_new_notification: false,
             eu_range: None,
         };
@@ -1285,6 +1312,83 @@ pub(super) mod tests {
             semantics_after_overflow(3, false),
             [(1, true), (2, false), (40, true)]
         );
+    }
+
+    #[test]
+    fn replaced_skipped_sample_keeps_semantics_changed() {
+        let start = Utc::now();
+        let at = |ms: i64| -> DateTime { (start + Duration::try_milliseconds(ms).unwrap()).into() };
+        let mut item = new_monitored_item(
+            1,
+            ReadValueId {
+                node_id: NodeId::null(),
+                attribute_id: AttributeId::Value as u32,
+                ..Default::default()
+            },
+            MonitoringMode::Reporting,
+            FilterType::None,
+            SamplingInterval::NonZero(TimeDelta::milliseconds(100)),
+            true,
+            Some(DataValue::new_at(0, at(0))),
+        );
+        item.queue_size = 5;
+        let _ = item.pop_notification();
+
+        // The value with the bit is held back by the sampling interval ...
+        assert!(item.notify_data_value(
+            DataValue::new_at_status(1, at(10), StatusCode::Good.set_semantics_changed(true)),
+            &at(10),
+            false
+        ));
+        // ... and replaced by a newer value before it is due.
+        assert!(item.notify_data_value(DataValue::new_at(2, at(20)), &at(20), false));
+        assert!(item.maybe_enqueue_skipped_value(&at(100)));
+
+        let Some(Notification::MonitoredItemNotification(n)) = item.pop_notification() else {
+            panic!("Expected a data change");
+        };
+        assert_eq!(n.value.value, Some(Variant::Int32(2)));
+        assert!(n.value.status().semantics_changed());
+        assert!(item.pop_notification().is_none());
+    }
+
+    #[test]
+    fn shrinking_the_queue_keeps_semantics_changed() {
+        let now = DateTime::now();
+        let mut item = new_monitored_item(
+            1,
+            ReadValueId {
+                node_id: NodeId::null(),
+                attribute_id: AttributeId::Value as u32,
+                ..Default::default()
+            },
+            MonitoringMode::Reporting,
+            FilterType::None,
+            SamplingInterval::Zero,
+            true,
+            Some(DataValue::new_at(1, now)),
+        );
+        item.queue_size = 3;
+        assert!(item.notify_data_value(DataValue::new_at(2, now), &now, false));
+        assert!(item.notify_data_value(
+            DataValue::new_at_status(3, now, StatusCode::Good.set_semantics_changed(true)),
+            &now,
+            false
+        ));
+        // discard_oldest shrinks from the back, dropping the value with the bit.
+        item.queue_size = 1;
+        item.shrink_queue_to_size();
+        assert_eq!(item.notification_queue.len(), 1);
+        assert!(item.notify_data_value(DataValue::new_at(4, now), &now, false));
+
+        let mut received = Vec::new();
+        while let Some(Notification::MonitoredItemNotification(n)) = item.pop_notification() {
+            let Some(Variant::Int32(value)) = n.value.value else {
+                panic!("Expected an Int32 value");
+            };
+            received.push((value, n.value.status().semantics_changed()));
+        }
+        assert_eq!(received, [(4, true)]);
     }
 
     #[test]
