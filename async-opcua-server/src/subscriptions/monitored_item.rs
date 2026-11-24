@@ -401,23 +401,40 @@ impl MonitoredItem {
     }
 
     /// Shrink the notification queue to the new threshold.
+    ///
+    /// Part 4, 5.13.3.2: discard by the item's policy, the oldest notifications
+    /// when `discard_oldest` is set and the newest otherwise. Part 4, 7.38.1: a
+    /// discarded SemanticsChanged bit moves to the surviving notification next to
+    /// the gap, so the next Publish still reports it.
     fn shrink_queue_to_size(&mut self) {
-        if self.notification_queue.len() > self.queue_size {
-            // Discard old notifications
-            let discard = self.notification_queue.len() - self.queue_size;
-            for _ in 0..discard {
-                let discarded = if self.discard_oldest {
-                    self.notification_queue.pop_back()
-                } else {
-                    self.notification_queue.pop_front()
-                };
-                if carries_semantics_changed(discarded.as_ref()) {
-                    self.pending_semantics_changed = true;
-                }
-            }
-            // Shrink the queue
-            self.notification_queue.shrink_to_fit();
+        if self.notification_queue.len() <= self.queue_size {
+            return;
         }
+        let discard = self.notification_queue.len() - self.queue_size;
+        let mut semantics_changed_lost = false;
+        for _ in 0..discard {
+            let discarded = if self.discard_oldest {
+                self.notification_queue.pop_front()
+            } else {
+                self.notification_queue.pop_back()
+            };
+            semantics_changed_lost |= carries_semantics_changed(discarded.as_ref());
+        }
+        if semantics_changed_lost {
+            let next_to_gap = if self.discard_oldest {
+                self.notification_queue.front_mut()
+            } else {
+                self.notification_queue.back_mut()
+            };
+            match next_to_gap {
+                Some(Notification::MonitoredItemNotification(n)) => {
+                    n.value.status = Some(n.value.status().set_semantics_changed(true));
+                }
+                // No data change left to carry it (e.g. only events): use the next one.
+                _ => self.pending_semantics_changed = true,
+            }
+        }
+        self.notification_queue.shrink_to_fit();
     }
 
     fn filter_by_sampling_interval(&self, new: &DataValue, from_subscription_tick: bool) -> bool {
@@ -1389,8 +1406,7 @@ pub(super) mod tests {
         assert_eq!(received, [true, true, false]);
     }
 
-    #[test]
-    fn shrinking_the_queue_keeps_semantics_changed() {
+    fn shrink_after(discard_oldest: bool) -> Vec<(i32, bool)> {
         let now = DateTime::now();
         let mut item = new_monitored_item(
             1,
@@ -1402,22 +1418,31 @@ pub(super) mod tests {
             MonitoringMode::Reporting,
             FilterType::None,
             SamplingInterval::Zero,
-            true,
+            discard_oldest,
             Some(DataValue::new_at(1, now)),
         );
         item.queue_size = 3;
-        assert!(item.notify_data_value(DataValue::new_at(2, now), &now, false));
-        assert!(item.notify_data_value(
-            DataValue::new_at_status(3, now, StatusCode::Good.set_semantics_changed(true)),
-            &now,
-            false
-        ));
-        // discard_oldest shrinks from the back, dropping the value with the bit.
+        // The bit sits on the value the policy discards first.
+        let with_bit = if discard_oldest { 1 } else { 3 };
+        let _ = item.pop_notification();
+        for value in [1, 2, 3] {
+            let status = if value == with_bit {
+                StatusCode::Good.set_semantics_changed(true)
+            } else {
+                StatusCode::Good
+            };
+            item.notification_queue
+                .push_back(Notification::MonitoredItemNotification(
+                    super::MonitoredItemNotification {
+                        client_handle: 1,
+                        value: DataValue::new_at_status(value, now, status),
+                    },
+                ));
+        }
         item.queue_size = 1;
         item.shrink_queue_to_size();
-        assert_eq!(item.notification_queue.len(), 1);
-        assert!(item.notify_data_value(DataValue::new_at(4, now), &now, false));
 
+        // Publish without any new value.
         let mut received = Vec::new();
         while let Some(Notification::MonitoredItemNotification(n)) = item.pop_notification() {
             let Some(Variant::Int32(value)) = n.value.value else {
@@ -1425,7 +1450,15 @@ pub(super) mod tests {
             };
             received.push((value, n.value.status().semantics_changed()));
         }
-        assert_eq!(received, [(4, true)]);
+        received
+    }
+
+    #[test]
+    fn shrinking_the_queue_discards_by_policy_and_keeps_semantics_changed() {
+        // discard_oldest keeps the newest value and carries the bit of the oldest to it.
+        assert_eq!(shrink_after(true), [(3, true)]);
+        // Otherwise the oldest value stays and carries the bit of the newest.
+        assert_eq!(shrink_after(false), [(1, true)]);
     }
 
     #[test]
