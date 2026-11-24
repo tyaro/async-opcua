@@ -610,15 +610,34 @@ impl MonitoredItem {
     fn enqueue_notification(&mut self, notification: impl Into<Notification>) {
         self.any_new_notification = true;
         let full = self.notification_queue.len() == self.queue_size;
+        let mut semantics_changed_lost = false;
         if full {
-            if self.discard_oldest {
-                self.notification_queue.pop_front();
+            let discarded = if self.discard_oldest {
+                self.notification_queue.pop_front()
             } else {
-                self.notification_queue.pop_back();
-            }
+                self.notification_queue.pop_back()
+            };
+            semantics_changed_lost = matches!(
+                discarded,
+                Some(Notification::MonitoredItemNotification(n)) if n.value.status().semantics_changed()
+            );
             self.queue_overflow = true;
         }
         self.notification_queue.push_back(notification.into());
+
+        // Part 4, 7.38.1: a SemanticsChanged bit must not be lost with a discarded
+        // value. Carry it to the value that follows the gap in delivery order,
+        // whatever the queue size.
+        if semantics_changed_lost {
+            let after_gap = if self.discard_oldest {
+                self.notification_queue.front_mut()
+            } else {
+                self.notification_queue.back_mut()
+            };
+            if let Some(Notification::MonitoredItemNotification(n)) = after_gap {
+                n.value.status = Some(n.value.status().set_semantics_changed(true));
+            }
+        }
 
         // Part 4, 5.13.1.5: mark the first value after the gap in delivery order.
         if full && self.queue_size > 1 {
@@ -1195,6 +1214,79 @@ pub(super) mod tests {
         );
     }
 
+    // OPC UA Part 4, 7.38.1: a full queue drops a value that carries
+    // SemanticsChanged; the next value in delivery order must carry it instead.
+    fn semantics_after_overflow(initial_len: usize, discard_oldest: bool) -> Vec<(i32, bool)> {
+        let now = DateTime::now();
+        let mut item = new_monitored_item(
+            1,
+            ReadValueId {
+                node_id: NodeId::null(),
+                attribute_id: AttributeId::Value as u32,
+                ..Default::default()
+            },
+            MonitoringMode::Reporting,
+            FilterType::None,
+            SamplingInterval::Zero,
+            discard_oldest,
+            Some(DataValue::new_at_status(
+                1,
+                now,
+                StatusCode::Good.set_semantics_changed(true),
+            )),
+        );
+        item.queue_size = initial_len;
+        for value in 2..=initial_len as i32 {
+            // Only the last value carries the bit when discarding the newest.
+            let status = if !discard_oldest && value == initial_len as i32 {
+                StatusCode::Good.set_semantics_changed(true)
+            } else {
+                StatusCode::Good
+            };
+            assert!(item.notify_data_value(
+                DataValue::new_at_status(value, now, status),
+                &now,
+                false
+            ));
+        }
+        assert_eq!(item.notification_queue.len(), item.queue_size);
+        assert!(item.notify_data_value(DataValue::new_at(40, now), &now, false));
+
+        let mut received = Vec::new();
+        while let Some(notification) = item.pop_notification() {
+            let Notification::MonitoredItemNotification(n) = notification else {
+                panic!("Expected a data change");
+            };
+            let Some(Variant::Int32(value)) = n.value.value else {
+                panic!("Expected an Int32 value");
+            };
+            received.push((value, n.value.status().semantics_changed()));
+        }
+        received
+    }
+
+    #[test]
+    fn queue_overflow_single_slot_keeps_semantics_changed() {
+        assert_eq!(semantics_after_overflow(1, true), [(40, true)]);
+        assert_eq!(semantics_after_overflow(1, false), [(40, true)]);
+    }
+
+    #[test]
+    fn queue_overflow_discard_oldest_moves_semantics_changed_to_next_value() {
+        assert_eq!(
+            semantics_after_overflow(3, true),
+            [(2, true), (3, false), (40, false)]
+        );
+    }
+
+    #[test]
+    fn queue_overflow_replace_last_moves_semantics_changed_to_new_value() {
+        assert_eq!(
+            semantics_after_overflow(3, false),
+            [(1, true), (2, false), (40, true)]
+        );
+    }
+
     #[test]
     fn monitored_item_delayed_sample() {
         let start = Utc::now();
@@ -1330,11 +1422,7 @@ pub(super) mod tests {
         assert!(item.notify_data_value(DataValue::new_at(2, second.into()), &second.into(), false));
         assert_eq!(item.notification_queue.len(), 1);
         assert_eq!(
-            item.sample_skipped_data_value
-                .as_ref()
-                .unwrap()
-                .value
-                .value,
+            item.sample_skipped_data_value.as_ref().unwrap().value.value,
             Some(Variant::Int32(2))
         );
 
