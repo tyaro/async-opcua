@@ -415,22 +415,14 @@ impl CertificateStore {
         Ok(())
     }
 
-    /// Returns a certificate file name from the cert's issuer and thumbprint fields.
-    /// File name is either "prefix - \[thumbprint\].der" or "thumbprint.der" depending on
-    /// the cert's common name being empty or not
+    /// Returns the file name a certificate is stored under in the trusted and
+    /// rejected directories: its SHA-1 thumbprint in lowercase hex, then `.der`.
+    ///
+    /// The name is built from the thumbprint alone. The common name comes from the
+    /// peer and may hold path separators, `..` or characters a file system rejects,
+    /// so it must not become part of a path.
     pub fn cert_file_name(cert: &X509) -> String {
-        let prefix = if let Ok(common_name) = cert.common_name() {
-            common_name.trim().to_string().replace('/', "")
-        } else {
-            String::new()
-        };
-        let thumbprint = cert.thumbprint().as_hex_string();
-
-        if !prefix.is_empty() {
-            format!("{prefix} [{thumbprint}].der")
-        } else {
-            format!("{thumbprint}.der")
-        }
+        format!("{}.der", cert.thumbprint().as_hex_string())
     }
 
     /// Creates the PKI directory structure

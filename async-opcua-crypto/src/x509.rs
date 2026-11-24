@@ -773,6 +773,11 @@ impl X509 {
     /// Tests if the supplied hostname matches any of the dns or ip alt subject name entries on the cert
     pub fn is_hostname_valid(&self, hostname: &str) -> Result<(), Error> {
         trace!("is_hostname_valid against {} on cert", hostname);
+        // A URL writes an IPv6 address in brackets, the alt name holds the bare address.
+        let hostname = hostname
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(hostname);
         // Look through alt subject names for a matching entry
         if hostname.is_empty() {
             error!("Hostname is empty");
@@ -788,7 +793,14 @@ impl X509 {
                 .any(|n| {
                     let name = AlternateNames::convert_name(n);
                     match name {
-                        Some(val) => val.eq_ignore_ascii_case(hostname),
+                        // Compare addresses as addresses, so any IPv6 spelling matches.
+                        Some(val) => match (
+                            val.parse::<std::net::IpAddr>(),
+                            hostname.parse::<std::net::IpAddr>(),
+                        ) {
+                            (Ok(name), Ok(host)) => name == host,
+                            _ => val.eq_ignore_ascii_case(hostname),
+                        },
                         _ => false,
                     }
                 });

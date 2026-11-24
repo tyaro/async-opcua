@@ -130,12 +130,12 @@ When we connect to a server for the first you will see some more entries added u
 
 ```
 ./pki/rejected/
-./pki/trusted/ServerFoo [f5baa2ed3896ef3048a148ea69a516a92a222fcc].der
+./pki/trusted/f5baa2ed3896ef3048a148ea69a516a92a222fcc.der
 ```
 
 The server's .der file was automatically stored in `./pki/trusted` because we told the client to automatically
-trust the server. The name of this file is derived from information in the certificate and its thumbprint
-to make a unique file. 
+trust the server. The name of this file is the certificate's thumbprint, so it is unique and never
+depends on names chosen by the peer.
 
 If we had told the client not to trust the server, the cert would have appeared
 under `/pki/rejected` and we would need to move it manually into the `/pki/trusted` folder. This

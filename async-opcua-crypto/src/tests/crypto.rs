@@ -17,7 +17,7 @@ use crate::{
         APPLICATION_URI,
     },
     user_identity::{legacy_secret_decrypt, legacy_secret_encrypt},
-    x509::{X509Data, X509},
+    x509::{AlternateNames, X509Data, X509},
     KeySize, PrivateKey, PublicKey, SecurityPolicy, SHA1_SIZE, SHA256_SIZE,
 };
 
@@ -32,14 +32,15 @@ fn create_cert() {
 
 #[test]
 fn cert_common_name_and_file_name() {
-    // The common name format is used for file names in the certificate store,
-    // so it must not change, or existing trusted certificates will not be found.
+    // File names in the certificate store come from the thumbprint alone. Stores
+    // written with the older "CN=x [thumbprint].der" names must be renamed by the
+    // application, or their trusted certificates will not be found.
     let (x509, _) = make_test_cert_1024();
     assert_eq!(x509.common_name().unwrap(), "CN=x");
     let file_name = CertificateStore::cert_file_name(&x509);
     assert_eq!(
         file_name,
-        format!("CN=x [{}].der", x509.thumbprint().as_hex_string())
+        format!("{}.der", x509.thumbprint().as_hex_string())
     );
 }
 
@@ -457,6 +458,56 @@ fn certificate_with_hostname_mismatch() {
         .unwrap();
     cert.is_hostname_valid(&APPLICATION_HOSTNAME.to_string().to_lowercase())
         .unwrap();
+}
+
+#[test]
+fn certificate_with_ipv6_hostname() {
+    let mut alt_host_names = AlternateNames::new();
+    alt_host_names.add_uri(APPLICATION_URI);
+    alt_host_names.add_address("2001:db8::1");
+    let args = X509Data {
+        key_size: 2048,
+        common_name: "x".to_string(),
+        organization: "x.org".to_string(),
+        organizational_unit: "x.org ops".to_string(),
+        country: "EN".to_string(),
+        state: "London".to_string(),
+        alt_host_names,
+        certificate_duration_days: 60,
+    };
+    let (cert, _) = X509::cert_and_pkey(&args).unwrap();
+
+    // A URL writes the address in brackets, and may spell it differently.
+    cert.is_hostname_valid("[2001:db8::1]").unwrap();
+    cert.is_hostname_valid("2001:db8::1").unwrap();
+    cert.is_hostname_valid("[2001:0db8:0:0:0:0:0:1]").unwrap();
+    let result = cert.is_hostname_valid("[2001:db8::2]").unwrap_err();
+    assert_eq!(result.status(), StatusCode::BadCertificateHostNameInvalid);
+}
+
+#[test]
+fn certificate_file_name_is_the_thumbprint_only() {
+    for common_name in ["a:b*c?", "..", "x<y>|z"] {
+        let mut alt_host_names = AlternateNames::new();
+        alt_host_names.add_uri(APPLICATION_URI);
+        let args = X509Data {
+            key_size: 2048,
+            common_name: common_name.to_string(),
+            organization: "x.org".to_string(),
+            organizational_unit: "x.org ops".to_string(),
+            country: "EN".to_string(),
+            state: "London".to_string(),
+            alt_host_names,
+            certificate_duration_days: 60,
+        };
+        let (cert, _) = X509::cert_and_pkey(&args).unwrap();
+        let name = CertificateStore::cert_file_name(&cert);
+        assert_eq!(name, format!("{}.der", cert.thumbprint().as_hex_string()));
+        assert!(name
+            .trim_end_matches(".der")
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit()));
+    }
 }
 
 #[test]
