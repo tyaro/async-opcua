@@ -552,7 +552,10 @@ impl MonitoredItem {
                 _ => (false, false),
             };
 
-        if !matches_filter {
+        // Part 4, 7.38.1: a value that reports SemanticsChanged is a change of its own,
+        // even when value and status match the last one (e.g. the units change twice
+        // while the measurement stays the same).
+        if !matches_filter && !value.status().semantics_changed() {
             return extra_enqueued;
         }
 
@@ -1350,6 +1353,40 @@ pub(super) mod tests {
         assert_eq!(n.value.value, Some(Variant::Int32(2)));
         assert!(n.value.status().semantics_changed());
         assert!(item.pop_notification().is_none());
+    }
+
+    #[test]
+    fn repeated_semantics_changed_passes_the_data_change_filter() {
+        let now = DateTime::now();
+        let mut item = new_monitored_item(
+            1,
+            ReadValueId {
+                node_id: NodeId::null(),
+                attribute_id: AttributeId::Value as u32,
+                ..Default::default()
+            },
+            MonitoringMode::Reporting,
+            FilterType::None,
+            SamplingInterval::Zero,
+            true,
+            Some(DataValue::new_at(1, now)),
+        );
+        item.queue_size = 5;
+        let _ = item.pop_notification();
+        let changed =
+            DataValue::new_at_status(1, now, StatusCode::Good.set_semantics_changed(true));
+        assert!(item.notify_data_value(changed.clone(), &now, false));
+        // Same value, status and timestamp: the second semantics change is still reported.
+        assert!(item.notify_data_value(changed, &now, false));
+        // An unchanged value without the bit is still filtered after it.
+        assert!(item.notify_data_value(DataValue::new_at(1, now), &now, false));
+        assert!(!item.notify_data_value(DataValue::new_at(1, now), &now, false));
+
+        let mut received = Vec::new();
+        while let Some(Notification::MonitoredItemNotification(n)) = item.pop_notification() {
+            received.push(n.value.status().semantics_changed());
+        }
+        assert_eq!(received, [true, true, false]);
     }
 
     #[test]
